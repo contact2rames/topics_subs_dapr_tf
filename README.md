@@ -343,7 +343,7 @@ terraform  destroy
 
 ## Validate deployed Azure resources
 
-After Terraform has successfully applied the configuration, use the Python validator to confirm that the Service Bus namespace and Container Apps environment exist, that the configured topics and subscriptions are present, and that SQL subscription filters and Dapr component metadata match the expected deployment.
+After Terraform has successfully applied the configuration, run the Python validator to compare deployed Azure resources with [`topics_subscriptions_dapr_components.csv`](./topics_subscriptions_dapr_components.csv). It checks that each listed Service Bus topic and subscription exists, verifies the `SubId` SQL rule against each listed filter (and checks that no custom `SubId` rule exists when a filter is blank), and compares Dapr component type, version, topic, consumer ID, and connection-string metadata presence.
 
 The validator is implemented in [`scripts/validate_azure_resources.py`](./scripts/validate_azure_resources.py). It uses the Azure management SDKs and `DefaultAzureCredential`, so it can use an authenticated Azure CLI session locally or another supported identity in CI. It does not read or print the Service Bus connection string. It only checks that the Dapr component has connection-string metadata configured.
 
@@ -368,37 +368,29 @@ On Linux or macOS, activate the virtual environment with:
 source .venv/bin/activate
 ```
 
-Create a deployment manifest by copying `validation.example.json` to `validation.json`, then replace the example resource names and topic/subscription/component entries with the values supplied to Terraform. Keep `topics` and `dapr_components` aligned with the Terraform `topics` and `pubsubs-hrw` maps. The `filter` value must exactly match the configured SQL filter; omit it for subscriptions that have no custom filter.
+The inventory CSV is generated from the QA Terraform variable values and contains `topic_subscription` rows for topics, subscriptions and filters, plus `dapr_component` rows for component names, topics and consumer IDs. Keep this CSV in sync whenever the Terraform topic or `pubsubs-hrw` configuration changes. The Azure resource group, Service Bus namespace, Container Apps environment, and subscription ID are provided at runtime.
 
-In PowerShell, create the local manifest with:
-
-```powershell
-Copy-Item .\validation.example.json .\validation.json
-```
-
-The manifest has these fields:
-
-- `resource_group`, `servicebus_namespace`, and `container_app_environment`: names of the existing Azure resources used by the deployment.
-- `topics`: each topic name and its subscriptions. Include `filter` for a subscription only when Terraform configures a SQL filter; the validator looks for the module's `SubId` rule.
-- `dapr_components`: each component's Azure resource name, `topic`, and `consumer_id`, corresponding to the `pubsubs-hrw` Terraform input.
-
-The example manifest is [`validation.example.json`](./validation.example.json). Do not put credentials or connection strings in the manifest.
-
-Run the validator from the repository root after `terraform apply`:
+Run from the repository root after `terraform apply`. Provide the deployment's actual Azure resource names and subscription ID:
 
 ```powershell
 python .\scripts\validate_azure_resources.py `
   --subscription-id "<azure-subscription-id>" `
-  --config .\validation.json
+  --resource-group "<azure-resource-group>" `
+  --servicebus-namespace "<servicebus-namespace>" `
+  --container-app-environment "<container-app-environment>" `
+  --inventory .\topics_subscriptions_dapr_components.csv `
+  --report .\azure_validation_report.csv
 ```
 
-The script reports each check and exits with:
+The inventory path defaults to `topics_subscriptions_dapr_components.csv` and the report path defaults to `azure_validation_report.csv` in the repository root, so both path options may be omitted. The report is a CSV with one row per check and columns for status, resource type, resource name, expected value, actual value, and details.
+
+The script prints the checks and exits with:
 
 - `0` when all configured resources and properties pass validation
-- `1` when one or more resources are missing or do not match the manifest
-- `2` when the manifest is invalid or an Azure request/authentication fails
+- `1` when one or more resources are missing or do not match the inventory
+- `2` when the inventory is invalid, an Azure request/authentication fails, or the report cannot be written
 
-The identity used by `DefaultAzureCredential` needs permission to read the namespace, topics, subscriptions, rules, Container Apps environment, and Dapr components. The script checks for the module's `SubId` SQL rule when a filter is specified. Dapr checks include component type, version, topic, consumer ID, and the presence (not the value) of connection-string metadata.
+The identity used by `DefaultAzureCredential` needs permission to read the namespace, topics, subscriptions, rules, Container Apps environment, and Dapr components. Connection-string values are never read or written to the report; only the presence of connection-string metadata is checked.
 
 ---
 

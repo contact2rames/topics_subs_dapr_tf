@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Validate Terraform-managed Azure Service Bus and Dapr resources."""
+"""Compare deployed Azure resources with the topic/component inventory CSV."""
 
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,106 +16,194 @@ from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.servicebus import ServiceBusManagementClient
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_INVENTORY = REPOSITORY_ROOT / "topics_subscriptions_dapr_components.csv"
+DEFAULT_REPORT = REPOSITORY_ROOT / "azure_validation_report.csv"
+REQUIRED_COLUMNS = {
+    "record_type",
+    "topic_name",
+    "subscription_name",
+    "filter_type",
+    "filter",
+    "component_name",
+    "component_topic",
+    "consumer_id",
+}
+
+
+@dataclass(frozen=True)
+class SubscriptionExpectation:
+    topic_name: str
+    name: str
+    filter_type: str
+    filter_expression: str
+
+
+@dataclass(frozen=True)
+class ComponentExpectation:
+    name: str
+    topic: str
+    consumer_id: str
+
+
+@dataclass(frozen=True)
+class Inventory:
+    topics: tuple[str, ...]
+    subscriptions: tuple[SubscriptionExpectation, ...]
+    components: tuple[ComponentExpectation, ...]
+
+
 class ValidationReport:
+    fieldnames = (
+        "status",
+        "resource_type",
+        "resource_name",
+        "expected",
+        "actual",
+        "details",
+    )
+
     def __init__(self) -> None:
-        self.passed = 0
-        self.failed = 0
+        self.rows: list[dict[str, str]] = []
 
-    def check(self, description: str, valid: bool, detail: str = "") -> None:
-        if valid:
-            self.passed += 1
-            print(f"PASS: {description}")
-        else:
-            self.failed += 1
-            suffix = f" ({detail})" if detail else ""
-            print(f"FAIL: {description}{suffix}")
+    def add(
+        self,
+        status: str,
+        resource_type: str,
+        resource_name: str,
+        expected: str = "",
+        actual: str = "",
+        details: str = "",
+    ) -> None:
+        row = {
+            "status": status,
+            "resource_type": resource_type,
+            "resource_name": resource_name,
+            "expected": expected,
+            "actual": actual,
+            "details": details,
+        }
+        self.rows.append(row)
+        message = f"{status}: {resource_type} '{resource_name}'"
+        if details:
+            message += f" - {details}"
+        print(message)
 
-    def missing(self, description: str) -> None:
-        self.check(description, False, "resource not found")
+    def error(self, resource_type: str, resource_name: str, exc: AzureError) -> None:
+        self.add("ERROR", resource_type, resource_name, details=str(exc))
+
+    def write(self, path: Path) -> None:
+        try:
+            with path.open("w", encoding="utf-8-sig", newline="") as report_file:
+                writer = csv.DictWriter(report_file, fieldnames=self.fieldnames)
+                writer.writeheader()
+                writer.writerows(self.rows)
+        except OSError as exc:
+            raise ValueError(f"Cannot write report file {path}: {exc}") from exc
+
+    @property
+    def failures(self) -> int:
+        return sum(row["status"] == "FAIL" for row in self.rows)
+
+    @property
+    def errors(self) -> int:
+        return sum(row["status"] == "ERROR" for row in self.rows)
 
 
-def _read_config(path: Path) -> dict[str, Any]:
+def _read_inventory(path: Path) -> Inventory:
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8-sig", newline="") as inventory_file:
+            reader = csv.DictReader(inventory_file)
+            if reader.fieldnames is None:
+                raise ValueError(f"Inventory CSV {path} is empty.")
+            missing_columns = REQUIRED_COLUMNS.difference(reader.fieldnames)
+            if missing_columns:
+                raise ValueError(
+                    f"Inventory CSV is missing required columns: "
+                    f"{', '.join(sorted(missing_columns))}."
+                )
+            rows = list(reader)
     except OSError as exc:
-        raise ValueError(f"Cannot read config file {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
-
-    if not isinstance(config, dict):
-        raise ValueError("The config root must be a JSON object.")
-
-    for field in ("resource_group", "servicebus_namespace", "container_app_environment"):
-        if not isinstance(config.get(field), str) or not config[field].strip():
-            raise ValueError(f"Config field '{field}' must be a non-empty string.")
-
-    topics = config.get("topics")
-    components = config.get("dapr_components")
-    if not isinstance(topics, list) or not topics:
-        raise ValueError("'topics' must be a non-empty array.")
-    if not isinstance(components, list) or not components:
-        raise ValueError("'dapr_components' must be a non-empty array.")
+        raise ValueError(f"Cannot read inventory CSV {path}: {exc}") from exc
 
     topic_names: set[str] = set()
-    for topic in topics:
-        if not isinstance(topic, dict) or not isinstance(topic.get("name"), str) or not topic["name"]:
-            raise ValueError("Each topic must be an object with a non-empty 'name'.")
-        if topic["name"] in topic_names:
-            raise ValueError(f"Duplicate topic name: {topic['name']}")
-        topic_names.add(topic["name"])
-        subscriptions = topic.get("subscriptions")
-        if not isinstance(subscriptions, list):
-            raise ValueError(f"Topic '{topic['name']}' must have a 'subscriptions' array.")
-        subscription_names: set[str] = set()
-        for subscription in subscriptions:
-            if (
-                not isinstance(subscription, dict)
-                or not isinstance(subscription.get("name"), str)
-                or not subscription["name"]
-            ):
-                raise ValueError(
-                    f"Each subscription for topic '{topic['name']}' must have a non-empty 'name'."
-                )
-            if subscription["name"] in subscription_names:
-                raise ValueError(
-                    f"Duplicate subscription '{subscription['name']}' in topic '{topic['name']}'."
-                )
-            subscription_names.add(subscription["name"])
-            if subscription.get("filter") is not None and not isinstance(
-                subscription["filter"], str
-            ):
-                raise ValueError(
-                    f"The filter for subscription '{subscription['name']}' must be a string."
-                )
-            filter_type = subscription.get("filter_type", "SqlFilter")
-            if filter_type not in ("SqlFilter", "CorrelationFilter"):
-                raise ValueError(
-                    f"Unsupported filter_type '{filter_type}' for subscription "
-                    f"'{subscription['name']}'."
-                )
-            if subscription.get("filter") and filter_type != "SqlFilter":
-                raise ValueError(
-                    f"Subscription '{subscription['name']}' has a filter, but this "
-                    "Terraform module configures filter expressions as SQL filters."
-                )
-
+    subscriptions: list[SubscriptionExpectation] = []
+    subscription_keys: set[tuple[str, str]] = set()
+    components: list[ComponentExpectation] = []
     component_names: set[str] = set()
-    for component in components:
-        if not isinstance(component, dict):
-            raise ValueError("Each Dapr component must be a JSON object.")
-        for field in ("name", "topic", "consumer_id"):
-            if not isinstance(component.get(field), str) or not component[field].strip():
-                raise ValueError(f"Each Dapr component must have a non-empty '{field}'.")
-        if component["name"] in component_names:
-            raise ValueError(f"Duplicate Dapr component name: {component['name']}")
-        component_names.add(component["name"])
-        if component["topic"] not in topic_names:
+
+    for line_number, row in enumerate(rows, start=2):
+        record_type = (row.get("record_type") or "").strip()
+        if record_type == "topic_subscription":
+            topic_name = (row.get("topic_name") or "").strip()
+            subscription_name = (row.get("subscription_name") or "").strip()
+            filter_type = (row.get("filter_type") or "").strip()
+            filter_expression = row.get("filter") or ""
+            if not topic_name or not subscription_name:
+                raise ValueError(
+                    f"CSV row {line_number}: topic_name and subscription_name "
+                    "are required for topic_subscription records."
+                )
+            if bool(filter_expression) != bool(filter_type):
+                raise ValueError(
+                    f"CSV row {line_number}: filter and filter_type must either "
+                    "both be set or both be blank."
+                )
+            if filter_expression and filter_type != "SqlFilter":
+                raise ValueError(
+                    f"CSV row {line_number}: only SqlFilter is supported when "
+                    "a filter expression is supplied."
+                )
+            key = (topic_name, subscription_name)
+            if key in subscription_keys:
+                raise ValueError(
+                    f"CSV row {line_number}: duplicate subscription "
+                    f"'{subscription_name}' on topic '{topic_name}'."
+                )
+            topic_names.add(topic_name)
+            subscription_keys.add(key)
+            subscriptions.append(
+                SubscriptionExpectation(
+                    topic_name, subscription_name, filter_type, filter_expression
+                )
+            )
+        elif record_type == "dapr_component":
+            name = (row.get("component_name") or "").strip()
+            topic = (row.get("component_topic") or "").strip()
+            consumer_id = (row.get("consumer_id") or "").strip()
+            if not name or not topic or not consumer_id:
+                raise ValueError(
+                    f"CSV row {line_number}: component_name, component_topic, "
+                    "and consumer_id are required for dapr_component records."
+                )
+            if name in component_names:
+                raise ValueError(
+                    f"CSV row {line_number}: duplicate Dapr component '{name}'."
+                )
+            component_names.add(name)
+            components.append(ComponentExpectation(name, topic, consumer_id))
+        else:
             raise ValueError(
-                f"Dapr component '{component['name']}' references topic "
-                f"'{component['topic']}' which is not listed in 'topics'."
+                f"CSV row {line_number}: unsupported record_type {record_type!r}."
             )
 
-    return config
+    if not topic_names:
+        raise ValueError("Inventory CSV contains no topic_subscription records.")
+    if not components:
+        raise ValueError("Inventory CSV contains no dapr_component records.")
+
+    for component in components:
+        if component.topic not in topic_names:
+            raise ValueError(
+                f"Dapr component '{component.name}' references topic "
+                f"'{component.topic}' which is not listed in the inventory."
+            )
+
+    return Inventory(
+        tuple(sorted(topic_names)),
+        tuple(subscriptions),
+        tuple(components),
+    )
 
 
 def _get(value: Any, *names: str) -> Any:
@@ -149,163 +238,340 @@ def _filter_details(rule: Any) -> tuple[str | None, str | None]:
     return filter_type, expression
 
 
-def validate(subscription_id: str, config: dict[str, Any]) -> int:
+def _validate_rule(
+    servicebus: ServiceBusManagementClient,
+    report: ValidationReport,
+    resource_group: str,
+    namespace: str,
+    subscription: SubscriptionExpectation,
+) -> None:
+    resource_name = f"{subscription.topic_name}/{subscription.name}/SubId"
+    try:
+        rule = servicebus.rules.get(
+            resource_group,
+            namespace,
+            subscription.topic_name,
+            subscription.name,
+            "SubId",
+        )
+    except ResourceNotFoundError:
+        if subscription.filter_expression:
+            report.add(
+                "FAIL",
+                "subscription_filter",
+                resource_name,
+                expected=f"{subscription.filter_type}: {subscription.filter_expression}",
+                actual="not found",
+                details="Expected the configured SubId rule.",
+            )
+        else:
+            report.add(
+                "PASS",
+                "subscription_filter",
+                resource_name,
+                expected="no custom SubId rule",
+                actual="not found",
+            )
+        return
+    except AzureError as exc:
+        report.error("subscription_filter", resource_name, exc)
+        return
+
+    filter_type, expression = _filter_details(rule)
+    if subscription.filter_expression:
+        valid = (
+            filter_type == subscription.filter_type
+            and expression == subscription.filter_expression
+        )
+        report.add(
+            "PASS" if valid else "FAIL",
+            "subscription_filter",
+            resource_name,
+            expected=f"{subscription.filter_type}: {subscription.filter_expression}",
+            actual=f"{filter_type}: {expression}",
+            details="" if valid else "Filter type or expression does not match the CSV.",
+        )
+    else:
+        report.add(
+            "FAIL",
+            "subscription_filter",
+            resource_name,
+            expected="no custom SubId rule",
+            actual=f"{filter_type}: {expression}",
+            details="A SubId rule exists but the CSV has no filter for this subscription.",
+        )
+
+
+def validate(
+    subscription_id: str,
+    resource_group: str,
+    namespace: str,
+    environment: str,
+    inventory: Inventory,
+    report: ValidationReport,
+) -> None:
     credential = DefaultAzureCredential()
     servicebus = ServiceBusManagementClient(credential, subscription_id)
     container_apps = ContainerAppsAPIClient(credential, subscription_id)
-    report = ValidationReport()
-    resource_group = config["resource_group"]
-    namespace = config["servicebus_namespace"]
-    environment = config["container_app_environment"]
 
     try:
         servicebus.namespaces.get(resource_group, namespace)
-        report.check(f"Service Bus namespace '{namespace}' exists", True)
+        namespace_exists = True
+        report.add(
+            "PASS",
+            "servicebus_namespace",
+            namespace,
+            expected="exists",
+            actual="exists",
+        )
     except ResourceNotFoundError:
-        report.missing(f"Service Bus namespace '{namespace}' exists")
-        print(f"\nSummary: {report.passed} passed, {report.failed} failed.")
-        return 1
+        namespace_exists = False
+        report.add(
+            "FAIL",
+            "servicebus_namespace",
+            namespace,
+            expected="exists",
+            actual="not found",
+        )
+    except AzureError as exc:
+        namespace_exists = False
+        report.error("servicebus_namespace", namespace, exc)
 
     try:
         container_apps.managed_environments.get(resource_group, environment)
-        report.check(f"Container Apps environment '{environment}' exists", True)
+        environment_exists = True
+        report.add(
+            "PASS",
+            "container_apps_environment",
+            environment,
+            expected="exists",
+            actual="exists",
+        )
     except ResourceNotFoundError:
-        report.missing(f"Container Apps environment '{environment}' exists")
-        print(f"\nSummary: {report.passed} passed, {report.failed} failed.")
-        return 1
+        environment_exists = False
+        report.add(
+            "FAIL",
+            "container_apps_environment",
+            environment,
+            expected="exists",
+            actual="not found",
+        )
+    except AzureError as exc:
+        environment_exists = False
+        report.error("container_apps_environment", environment, exc)
 
-    for topic in config["topics"]:
-        topic_name = topic["name"]
+    topic_results: dict[str, bool] = {}
+    for topic_name in inventory.topics:
+        if not namespace_exists:
+            topic_results[topic_name] = False
+            report.add(
+                "SKIP",
+                "servicebus_topic",
+                topic_name,
+                details="Cannot check topic because the namespace is unavailable.",
+            )
+            continue
         try:
             servicebus.topics.get(resource_group, namespace, topic_name)
-            report.check(f"Topic '{topic_name}' exists", True)
+            topic_results[topic_name] = True
+            report.add(
+                "PASS",
+                "servicebus_topic",
+                topic_name,
+                expected="exists",
+                actual="exists",
+            )
         except ResourceNotFoundError:
-            report.missing(f"Topic '{topic_name}' exists")
+            topic_results[topic_name] = False
+            report.add(
+                "FAIL",
+                "servicebus_topic",
+                topic_name,
+                expected="exists",
+                actual="not found",
+            )
+        except AzureError as exc:
+            topic_results[topic_name] = False
+            report.error("servicebus_topic", topic_name, exc)
+
+    for subscription in inventory.subscriptions:
+        resource_name = f"{subscription.topic_name}/{subscription.name}"
+        if not topic_results.get(subscription.topic_name, False):
+            report.add(
+                "SKIP",
+                "servicebus_subscription",
+                resource_name,
+                details="Cannot check subscription because its topic is unavailable.",
+            )
             continue
-
-        for subscription in topic["subscriptions"]:
-            subscription_name = subscription["name"]
-            try:
-                servicebus.subscriptions.get(
-                    resource_group, namespace, topic_name, subscription_name
-                )
-                report.check(
-                    f"Subscription '{subscription_name}' exists on topic '{topic_name}'",
-                    True,
-                )
-            except ResourceNotFoundError:
-                report.missing(
-                    f"Subscription '{subscription_name}' exists on topic '{topic_name}'"
-                )
-                continue
-
-            expected_filter = subscription.get("filter")
-            if not expected_filter:
-                continue
-
-            rule_name = "SubId"
-            description = (
-                f"SQL filter for subscription '{subscription_name}' on topic '{topic_name}'"
+        try:
+            servicebus.subscriptions.get(
+                resource_group,
+                namespace,
+                subscription.topic_name,
+                subscription.name,
             )
-            try:
-                rule = servicebus.rules.get(
-                    resource_group, namespace, topic_name, subscription_name, rule_name
-                )
-            except ResourceNotFoundError:
-                report.missing(description)
-                continue
-
-            filter_type, expression = _filter_details(rule)
-            filter_matches = (
-                filter_type is not None
-                and filter_type.casefold() == "sqlfilter"
-                and expression == expected_filter
+            report.add(
+                "PASS",
+                "servicebus_subscription",
+                resource_name,
+                expected="exists",
+                actual="exists",
             )
-            report.check(
-                description,
-                filter_matches,
-                f"expected SQL expression {expected_filter!r}, got "
-                f"type={filter_type!r}, expression={expression!r}",
+        except ResourceNotFoundError:
+            report.add(
+                "FAIL",
+                "servicebus_subscription",
+                resource_name,
+                expected="exists",
+                actual="not found",
             )
+            continue
+        except AzureError as exc:
+            report.error("servicebus_subscription", resource_name, exc)
+            continue
+        _validate_rule(
+            servicebus, report, resource_group, namespace, subscription
+        )
 
-    for component in config["dapr_components"]:
-        component_name = component["name"]
-        description = f"Dapr component '{component_name}' exists"
+    for component in inventory.components:
+        resource_name = component.name
+        if not environment_exists:
+            report.add(
+                "SKIP",
+                "dapr_component",
+                resource_name,
+                details="Cannot check component because the environment is unavailable.",
+            )
+            continue
         try:
             dapr_component = container_apps.dapr_components.get(
-                resource_group, environment, component_name
+                resource_group, environment, component.name
             )
         except ResourceNotFoundError:
-            report.missing(description)
+            report.add(
+                "FAIL",
+                "dapr_component",
+                resource_name,
+                expected="exists",
+                actual="not found",
+            )
+            continue
+        except AzureError as exc:
+            report.error("dapr_component", resource_name, exc)
             continue
 
         properties = _get(dapr_component, "properties")
+        report.add(
+            "PASS",
+            "dapr_component",
+            resource_name,
+            expected="exists",
+            actual="exists",
+        )
         component_type = _get(properties, "component_type", "componentType")
         version = _get(properties, "version")
         metadata = _metadata_map(_get(properties, "metadata"))
 
-        report.check(description, True)
-        report.check(
-            f"Dapr component '{component_name}' uses Azure Service Bus topics",
-            component_type == "pubsub.azure.servicebus.topics",
-            f"got {component_type!r}",
+        expected_type = "pubsub.azure.servicebus.topics"
+        report.add(
+            "PASS" if component_type == expected_type else "FAIL",
+            "dapr_component_type",
+            resource_name,
+            expected=expected_type,
+            actual=str(component_type),
         )
-        report.check(
-            f"Dapr component '{component_name}' has version 'v1'",
-            version == "v1",
-            f"got {version!r}",
+        report.add(
+            "PASS" if version == "v1" else "FAIL",
+            "dapr_component_version",
+            resource_name,
+            expected="v1",
+            actual=str(version),
         )
-
-        expected_metadata = {
-            "topic": component["topic"],
-            "consumerid": component["consumer_id"],
-        }
-        for key, expected in expected_metadata.items():
+        for key, expected in (
+            ("topic", component.topic),
+            ("consumerid", component.consumer_id),
+        ):
             item = metadata.get(key)
             actual = _get(item, "value") if item is not None else None
-            report.check(
-                f"Dapr component '{component_name}' metadata '{key}' matches",
-                actual == expected,
-                f"expected {expected!r}, got {actual!r}",
+            valid = actual == expected
+            report.add(
+                "PASS" if valid else "FAIL",
+                f"dapr_metadata_{key}",
+                resource_name,
+                expected=expected,
+                actual="" if actual is None else str(actual),
+                details="" if valid else "Metadata value does not match the CSV.",
             )
-        report.check(
-            f"Dapr component '{component_name}' has connection-string metadata",
-            "connectionstring" in metadata,
-        )
 
-    print(f"\nSummary: {report.passed} passed, {report.failed} failed.")
-    return 1 if report.failed else 0
+        has_connection_string = "connectionstring" in metadata
+        report.add(
+            "PASS" if has_connection_string else "FAIL",
+            "dapr_connection_string_metadata",
+            resource_name,
+            expected="present",
+            actual="present" if has_connection_string else "missing",
+            details=(
+                "The connection-string value is intentionally not read or reported."
+                if has_connection_string
+                else "The Dapr component has no connectionString metadata."
+            ),
+        )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Check that the configured Azure Service Bus and Dapr resources exist "
-            "and match the deployment manifest."
+            "Compare deployed Azure Service Bus and Dapr resources with the "
+            "topic/subscription/component inventory CSV."
         )
     )
+    parser.add_argument("--subscription-id", required=True)
+    parser.add_argument("--resource-group", required=True)
+    parser.add_argument("--servicebus-namespace", required=True)
+    parser.add_argument("--container-app-environment", required=True)
     parser.add_argument(
-        "--subscription-id",
-        required=True,
-        help="Azure subscription ID containing the deployed resources.",
+        "--inventory",
+        type=Path,
+        default=DEFAULT_INVENTORY,
+        help=f"Inventory CSV (default: {DEFAULT_INVENTORY})",
     )
     parser.add_argument(
-        "--config",
-        required=True,
+        "--report",
         type=Path,
-        help="Path to the JSON deployment manifest.",
+        default=DEFAULT_REPORT,
+        help=f"Output CSV report (default: {DEFAULT_REPORT})",
     )
     args = parser.parse_args()
 
     try:
-        config = _read_config(args.config)
-        return validate(args.subscription_id, config)
+        inventory = _read_inventory(args.inventory)
+        report = ValidationReport()
+        validate(
+            args.subscription_id,
+            args.resource_group,
+            args.servicebus_namespace,
+            args.container_app_environment,
+            inventory,
+            report,
+        )
+        report.write(args.report)
     except ValueError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        print(f"Configuration or report error: {exc}", file=sys.stderr)
         return 2
     except AzureError as exc:
         print(f"Azure request failed: {exc}", file=sys.stderr)
         return 2
+
+    print(
+        f"\nReport: {args.report.resolve()}\n"
+        f"Summary: {sum(row['status'] == 'PASS' for row in report.rows)} passed, "
+        f"{report.failures} failed, {report.errors} errors, "
+        f"{sum(row['status'] == 'SKIP' for row in report.rows)} skipped."
+    )
+    if report.errors:
+        return 2
+    return 1 if report.failures else 0
 
 
 if __name__ == "__main__":
