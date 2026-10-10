@@ -1,4 +1,5 @@
 # topics_subs_dapr_tf
+---
 
 A Terraform project for provisioning Azure Service Bus topics, topic subscriptions, and Dapr pub/sub components for Azure Container Apps.
 
@@ -484,17 +485,6 @@ For production-grade deployments, store secrets in Azure Key Vault or another se
 
 ---
 
-## Best practices
-
-- Keep topic names consistent with application domains.
-- Use subscription filters to reduce unnecessary processing.
-- Define consumer IDs clearly per service or worker role.
-- Use environment separation such as `dev`, `qa`, `prod` in the Terraform variables.
-- Add a central naming convention for topics, subscriptions, and Dapr component names.
-- Review dead-lettering policies and message TTL values for your workload.
-
----
-
 ## Notes for this repository
 
 This project is a good fit when you need to:
@@ -506,17 +496,6 @@ This project is a good fit when you need to:
 
 It is intentionally focused on the infrastructure provisioning side rather than application business logic, so the application code itself is not included in this repository.
 
----
-
-## Recommended next steps
-
-- Add a `terraform.tfvars` file with environment-specific values.
-- Add outputs if you want to surface created resource names or IDs.
-- Add additional validation and policy checks for production readiness.
-- Consider using Azure Key Vault for sensitive values instead of passing them directly in configuration.
-- Expand the repository with app-level Dapr components or subscriber service definitions if needed.
-
----
 
 ## Summary
 
