@@ -8,3 +8,6 @@
 # Terraform crash logs
 crash.log
 crash.*.log
+
+# Environment-specific validation manifest
+validation.json

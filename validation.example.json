@@ -1,0 +1,27 @@
+{
+  "resource_group": "example-resource-group",
+  "servicebus_namespace": "example-servicebus-namespace",
+  "container_app_environment": "example-container-app-environment",
+  "topics": [
+    {
+      "name": "job-status",
+      "subscriptions": [
+        {
+          "name": "job-status-created",
+          "filter": "status = 'created'",
+          "filter_type": "SqlFilter"
+        },
+        {
+          "name": "job-status-all"
+        }
+      ]
+    }
+  ],
+  "dapr_components": [
+    {
+      "name": "job-status-events",
+      "topic": "job-status",
+      "consumer_id": "job-status-service"
+    }
+  ]
+}
