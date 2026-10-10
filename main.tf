@@ -7,5 +7,4 @@ module "dapr_components" {
     servicebus_connection_string = var.servicebus_connection_string
     container_app_environment = var.container_app_environment
     pubsubs-hrw = var.pubsubs-hrw
-    
 }
