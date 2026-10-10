@@ -320,25 +320,25 @@ Before running Terraform, ensure the following are available:
 ### Initialize Terraform
 
 ```bash
-terraform -chdir=qa init
+terraform init
 ```
 
 ### Review planned changes
 
 ```bash
-terraform -chdir=qa plan
+terraform  plan
 ```
 
 ### Apply the configuration
 
 ```bash
-terraform -chdir=qa apply
+terraform  apply
 ```
 
 ### Destroy the environment
 
 ```bash
-terraform -chdir=qa destroy
+terraform  destroy
 ```
 
 ## Validate deployed Azure resources
